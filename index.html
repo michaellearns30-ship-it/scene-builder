@@ -219,7 +219,7 @@
         <button data-dur="15">15s</button>
       </div>
       <p class="hint" id="keyInfo">No camera keys yet. Orbit to a view, then tap + Camera key.</p>
-      <p class="hint">Keys are joined into a smooth curve. Two or more are needed to play.</p>
+      <p class="hint">Two or more keys are joined into a smooth curve. With Loop on and three or more keys the path closes into a circuit, so the clip repeats with no jump.</p>
     </section>
 
     <!-- RENDER -->
@@ -333,7 +333,7 @@ const state = {
   view: 'normal',
   keys: [],
   duration: 5,        // seconds for the whole camera path
-  loop: false,        // replay the path while the tab is open
+  loop: false,        // replay the path, and close it into a seamless circuit
   recPass: 'clay',    // clay or depth, used by Render & record
   nextId: 1,
   recording: false
@@ -470,6 +470,7 @@ function setLoop(on) {
   const btn = document.getElementById('btnLoop');
   btn.textContent = 'Loop: ' + (state.loop ? 'on' : 'off');
   btn.classList.toggle('blue', state.loop);
+  if (state.loop && state.keys.length === 2) toast('Add a third camera key for a seamless loop');
   persist();
 }
 
@@ -552,19 +553,38 @@ function addKey() {
   toast(`Key ${state.keys.length} added`);
 }
 
+function samePoint(a, b) {
+  return a.every((n, i) => Math.abs(n - b[i]) < 0.002);
+}
+
+/* A closed curve already joins the last key back to the first, so an explicit
+   duplicate of the first key at the end would leave a zero-length segment. */
+function withoutClosingKey(keys) {
+  if (keys.length < 3) return keys;
+  const first = keys[0], last = keys[keys.length - 1];
+  return samePoint(first.p, last.p) && samePoint(first.t, last.t) ? keys.slice(0, -1) : keys;
+}
+
 let pathAnimation = null;
 
 /* Flies the camera along the keyframes in state.duration seconds.
    GSAP drives it when the CDN build loaded; the same motion is reproduced
-   on the native clock if it did not, so the app never depends on a CDN to animate. */
+   on the native clock if it did not, so the app never depends on a CDN to animate.
+   With loop on, the path is a closed circuit travelled at constant speed, so the
+   end of one pass is the start of the next — no jump, no stall at the join. */
 function playPath(options = {}) {
   if (state.keys.length < 2) { toast('Add at least two camera keys'); return Promise.resolve(); }
   if (pathAnimation) return Promise.resolve();
 
-  const posCurve = new THREE.CatmullRomCurve3(state.keys.map(k => new THREE.Vector3(...k.p)));
-  const tgtCurve = new THREE.CatmullRomCurve3(state.keys.map(k => new THREE.Vector3(...k.t)));
-  const seconds = Math.max(1, Number(options.seconds || state.duration) || 5);
   const repeat = options.loop !== undefined ? !!options.loop : state.loop;
+  const asked = options.closed !== undefined ? !!options.closed : state.loop;
+  // A closed curve returns to its first key, so one pass ends exactly where it began.
+  // Three keys is the minimum — two would only retrace the same line.
+  const closed = asked && state.keys.length > 2;
+  const keys = closed ? withoutClosingKey(state.keys) : state.keys;
+  const posCurve = new THREE.CatmullRomCurve3(keys.map(k => new THREE.Vector3(...k.p)), closed);
+  const tgtCurve = new THREE.CatmullRomCurve3(keys.map(k => new THREE.Vector3(...k.t)), closed);
+  const seconds = Math.max(1, Number(options.seconds || state.duration) || 5);
 
   controls.enabled = false;
   const proxy = { u: 0 };
@@ -588,7 +608,9 @@ function playPath(options = {}) {
       const tween = gsap.to(proxy, {
         u: 1,
         duration: seconds,
-        ease: 'power1.inOut',
+        // Constant speed when the path is closed: an ease would slow to a stop at
+        // the join, which is the visible hitch you would see on every repeat.
+        ease: closed ? 'none' : 'power1.inOut',
         repeat: repeat ? -1 : 0,
         onUpdate: apply,
         onComplete: finish
@@ -601,12 +623,12 @@ function playPath(options = {}) {
       const total = seconds * 1000;
       const step = () => {
         if (stopped) return;
-        const t = Math.min(1, (performance.now() - start) / total);
-        proxy.u = t;
+        const elapsed = performance.now() - start;
+        proxy.u = closed ? (elapsed % total) / total : Math.min(1, elapsed / total);
         apply();
-        if (t < 1) requestAnimationFrame(step);
-        else if (repeat) { start = performance.now(); requestAnimationFrame(step); }
-        else finish();
+        if (elapsed < total) { requestAnimationFrame(step); return; }
+        if (repeat) { start = performance.now(); requestAnimationFrame(step); return; }
+        finish();
       };
       requestAnimationFrame(step);
       pathAnimation = {
@@ -721,7 +743,8 @@ function stopRecording() {
 }
 
 /* One button: switch to the chosen clay/depth pass, fly the camera path and save the video.
-   The recording is started here, inside the click, because captureStream needs a user gesture. */
+   The recording is started here, inside the click, because captureStream needs a user gesture.
+   With loop on it records exactly one closed pass, which is the clip that tiles cleanly. */
 async function renderAndRecord() {
   if (state.keys.length < 2) { toast('Add at least two camera keys first'); return; }
   state.view = state.recPass;
