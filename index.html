@@ -318,7 +318,10 @@ scene.add(grid);
 
 /* ---------- materials ---------- */
 const clayMat = new THREE.MeshStandardMaterial({ color: 0xdedede, roughness: 0.9, metalness: 0.02 });
-const depthMat = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
+// BasicDepthPacking writes a plain grayscale ramp (near = white, far = black) into RGB.
+// That is what depth-guided video tools expect. RGBADepthPacking packs depth across
+// all four channels, which chroma subsampling destroys into coloured noise.
+const depthMat = new THREE.MeshDepthMaterial();
 
 const PALETTE = ['#ffb02e', '#7aa2ff', '#6ee7b7', '#ff9ecb', '#c4b5fd', '#f6d365'];
 
