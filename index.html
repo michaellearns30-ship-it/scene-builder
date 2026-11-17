@@ -10,6 +10,7 @@
 <link rel="apple-touch-icon" href="./icons/icon-512.png">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<script src="https://unpkg.com/gsap@3.12.5/dist/gsap.min.js"></script>
 <script type="importmap">
 {
   "imports": {
@@ -127,6 +128,13 @@
   .rec span.time{font-size:13px;font-variant-numeric:tabular-nums;color:#ffd9d9}
   .rec button{height:32px;padding:0 12px;border-radius:99px;background:rgba(255,107,107,.2);
     border:1px solid rgba(255,107,107,.5);color:#ffd9d9;font-size:12.5px;font-weight:600}
+
+  /* quick transform switcher, only while something is selected */
+  .quickbar{display:flex;gap:6px;padding:8px 12px 0}
+  .qbtn{flex:1;height:38px;border-radius:11px;font-size:12.5px;font-weight:650;color:var(--dim);
+    border:1px solid var(--line);background:rgba(255,255,255,.03);transition:transform .14s,color .14s,background .14s}
+  .qbtn.on{color:#0c0d10;background:var(--ink);border-color:var(--ink)}
+  .qbtn:active{transform:scale(.97)}
 </style>
 </head>
 <body>
@@ -151,6 +159,11 @@
 <input type="file" id="fileInput" accept="application/json,.json" hidden>
 
 <div class="deck">
+  <div class="quickbar" id="quickBar" hidden>
+    <button class="qbtn" data-qmode="move">Move</button>
+    <button class="qbtn" data-qmode="rotate">Rotate</button>
+    <button class="qbtn" data-qmode="scale">Scale</button>
+  </div>
   <div class="tabs" role="tablist">
     <button class="tab active" data-tab="build">Build</button>
     <button class="tab" data-tab="xform">Transform</button>
@@ -165,6 +178,7 @@
         <button class="btn" data-add="cube">&#9633; Cube</button>
         <button class="btn" data-add="sphere">&#9679; Sphere</button>
         <button class="btn" data-add="ramp">&#9651; Ramp</button>
+        <button class="btn" data-add="plane">&#9711; Floor</button>
       </div>
       <div class="row">
         <button class="btn" id="btnDuplicate">Duplicate</button>
@@ -196,6 +210,13 @@
       </div>
       <div class="row">
         <button class="btn" id="btnClearKeys">Clear keys</button>
+        <button class="btn" id="btnLoop">Loop: off</button>
+      </div>
+      <p class="hint">Timeline length — how long the camera takes to run the whole path:</p>
+      <div class="seg" id="durSeg">
+        <button data-dur="5" class="on">5s</button>
+        <button data-dur="10">10s</button>
+        <button data-dur="15">15s</button>
       </div>
       <p class="hint" id="keyInfo">No camera keys yet. Orbit to a view, then tap + Camera key.</p>
       <p class="hint">Keys are joined into a smooth curve. Two or more are needed to play.</p>
@@ -208,12 +229,18 @@
         <button data-view="clay">Clay</button>
         <button data-view="depth">Depth</button>
       </div>
-      <div class="row">
-        <button class="btn primary" id="btnRecord">&#9679; Record</button>
-        <button class="btn" id="btnRecordPath">Record path</button>
+      <p class="hint">Pass used for the video:</p>
+      <div class="seg" id="recModeSeg">
+        <button data-rec="clay" class="on">Clay</button>
+        <button data-rec="depth">Depth</button>
       </div>
-      <p class="hint" id="recHint">Saves straight to your phone. Chrome records .webm, Safari .mp4 — whichever the browser supports.</p>
-      <p class="hint">Record path plays the camera keys and stops itself at the end.</p>
+      <div class="row">
+        <button class="btn primary" id="btnRenderRecord">&#9679; Render &amp; record</button>
+      </div>
+      <div class="row">
+        <button class="btn" id="btnRecord">Record (manual)</button>
+      </div>
+      <p class="hint" id="recHint">Render &amp; record switches to the pass above, flies the camera keys and saves the video when it finishes. Chrome records .webm, Safari .mp4 — whichever the browser supports.</p>
     </section>
   </div>
 </div>
@@ -223,9 +250,11 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 /* ============================================================
-   Scene Builder — a touch-first Three.js editor.
+   Scene Builder — a touch-first Three.js block-out tool.
    Everything that matters is in one file so it can be edited
-   on a phone. Saved scenes are plain JSON: see SCENE_SCHEMA.
+   on a phone. Saved scenes are plain JSON: see serialize().
+   GSAP drives the camera path when its CDN build is present;
+   the same motion is reproduced on the native clock when not.
    ============================================================ */
 
 const canvas = document.getElementById('view');
@@ -300,6 +329,9 @@ const state = {
   mode: 'move',
   view: 'normal',
   keys: [],
+  duration: 5,        // seconds for the whole camera path
+  loop: false,        // replay the path while the tab is open
+  recPass: 'clay',    // clay or depth, used by Render & record
   nextId: 1,
   recording: false
 };
@@ -333,6 +365,7 @@ function rampGeometry() {
 function makeGeometry(type) {
   if (type === 'sphere') return new THREE.SphereGeometry(0.55, 32, 24);
   if (type === 'ramp') return rampGeometry();
+  if (type === 'plane') return new THREE.BoxGeometry(3, 0.04, 3);
   return new THREE.BoxGeometry(1, 1, 1);
 }
 
@@ -350,13 +383,14 @@ function addObject(type, opts = {}) {
   mesh.receiveShadow = true;
 
   const id = state.nextId++;
-  const label = { cube: 'Cube', sphere: 'Sphere', ramp: 'Ramp' }[type] || 'Shape';
+  const label = { cube: 'Cube', sphere: 'Sphere', ramp: 'Ramp', plane: 'Floor' }[type] || 'Shape';
   mesh.name = opts.name || `${label} ${id}`;
 
   if (opts.position) mesh.position.fromArray(opts.position);
   else {
     const n = state.objects.length;
-    mesh.position.set(((n % 3) - 1) * 1.8, type === 'sphere' ? 0.55 : 0.5, Math.floor(n / 3) * -1.8);
+    const restY = type === 'sphere' ? 0.55 : type === 'plane' ? 0.02 : 0.5;
+    mesh.position.set(((n % 3) - 1) * 1.8, restY, Math.floor(n / 3) * -1.8);
   }
   if (opts.rotation) mesh.rotation.set(opts.rotation[0], opts.rotation[1], opts.rotation[2]);
   if (opts.scale) mesh.scale.fromArray(opts.scale);
@@ -372,6 +406,7 @@ function addObject(type, opts = {}) {
 
 function select(record) {
   state.selected = record || null;
+  document.getElementById('quickBar').hidden = !record;
   if (record) {
     helper.setFromObject(record.mesh);
     helper.visible = state.view === 'normal';
@@ -400,7 +435,7 @@ function refreshChips() {
   });
 }
 
-/* ---------- transform sliders ---------- */
+/* ---------- transform ---------- */
 const slidersEl = document.getElementById('sliders');
 const xformHint = document.getElementById('xformHint');
 const AXES = ['x', 'y', 'z'];
@@ -410,6 +445,40 @@ function modeConfig() {
   if (state.mode === 'rotate') return { min: -Math.PI, max: Math.PI, step: 0.01, unit: ' rad', deg: true };
   if (state.mode === 'scale') return { min: 0.1, max: 4, step: 0.01, unit: '×' };
   return { min: -10, max: 10, step: 0.01, unit: '' };
+}
+
+function setMode(mode) {
+  state.mode = mode;
+  document.querySelectorAll('#modeSeg button').forEach((b) => b.classList.toggle('on', b.dataset.mode === mode));
+  document.querySelectorAll('#quickBar button').forEach((b) => b.classList.toggle('on', b.dataset.qmode === mode));
+  buildSliders();
+}
+
+function setDuration(seconds) {
+  state.duration = Math.max(1, Number(seconds) || 5);
+  document.querySelectorAll('#durSeg button').forEach((b) =>
+    b.classList.toggle('on', Number(b.dataset.dur) === state.duration));
+  updateKeyInfo();
+  persist();
+}
+
+function setLoop(on) {
+  state.loop = !!on;
+  const btn = document.getElementById('btnLoop');
+  btn.textContent = 'Loop: ' + (state.loop ? 'on' : 'off');
+  btn.classList.toggle('blue', state.loop);
+  persist();
+}
+
+function setRecPass(pass, preview = false) {
+  state.recPass = pass === 'depth' ? 'depth' : 'clay';
+  document.querySelectorAll('#recModeSeg button').forEach((b) =>
+    b.classList.toggle('on', b.dataset.rec === state.recPass));
+  if (preview) {
+    state.view = state.recPass;
+    applyView();
+  }
+  persist();
 }
 
 function buildSliders() {
@@ -466,7 +535,7 @@ function syncSliders() {
 const keyInfo = document.getElementById('keyInfo');
 function updateKeyInfo() {
   keyInfo.textContent = state.keys.length
-    ? `${state.keys.length} key${state.keys.length === 1 ? '' : 's'} — ${state.keys.length > 1 ? 'ready to play' : 'add one more'}`
+    ? `${state.keys.length} key${state.keys.length === 1 ? '' : 's'} — ${state.keys.length > 1 ? `${state.duration}s path, ready to play` : 'add one more'}`
     : 'No camera keys yet. Orbit to a view, then tap + Camera key.';
 }
 
@@ -481,36 +550,72 @@ function addKey() {
 }
 
 let pathAnimation = null;
+
+/* Flies the camera along the keyframes in state.duration seconds.
+   GSAP drives it when the CDN build loaded; the same motion is reproduced
+   on the native clock if it did not, so the app never depends on a CDN to animate. */
 function playPath(options = {}) {
   if (state.keys.length < 2) { toast('Add at least two camera keys'); return Promise.resolve(); }
   if (pathAnimation) return Promise.resolve();
 
   const posCurve = new THREE.CatmullRomCurve3(state.keys.map(k => new THREE.Vector3(...k.p)));
   const tgtCurve = new THREE.CatmullRomCurve3(state.keys.map(k => new THREE.Vector3(...k.t)));
-  const duration = Math.max(2.5, state.keys.length * 1.7) * 1000;
-  const start = performance.now();
+  const seconds = Math.max(1, Number(options.seconds || state.duration) || 5);
+  const repeat = options.loop !== undefined ? !!options.loop : state.loop;
+
   controls.enabled = false;
+  const proxy = { u: 0 };
+  let stopped = false;
 
   return new Promise((resolve) => {
-    pathAnimation = { start, duration, posCurve, tgtCurve, resolve };
-    requestAnimationFrame(tickPath);
+    const apply = () => {
+      camera.position.copy(posCurve.getPointAt(proxy.u));
+      controls.target.copy(tgtCurve.getPointAt(proxy.u));
+      controls.update();
+    };
+    const finish = () => {
+      if (stopped) return;
+      stopped = true;
+      pathAnimation = null;
+      controls.enabled = true;
+      resolve();
+    };
+
+    if (window.gsap) {
+      const tween = gsap.to(proxy, {
+        u: 1,
+        duration: seconds,
+        ease: 'power1.inOut',
+        repeat: repeat ? -1 : 0,
+        onUpdate: apply,
+        onComplete: finish
+      });
+      pathAnimation = {
+        stop: () => { stopped = true; tween.kill(); pathAnimation = null; controls.enabled = true; resolve(); }
+      };
+    } else {
+      let start = performance.now();
+      const total = seconds * 1000;
+      const step = () => {
+        if (stopped) return;
+        const t = Math.min(1, (performance.now() - start) / total);
+        proxy.u = t;
+        apply();
+        if (t < 1) requestAnimationFrame(step);
+        else if (repeat) { start = performance.now(); requestAnimationFrame(step); }
+        else finish();
+      };
+      requestAnimationFrame(step);
+      pathAnimation = {
+        stop: () => { stopped = true; pathAnimation = null; controls.enabled = true; resolve(); }
+      };
+    }
   });
 }
 
-function tickPath() {
-  if (!pathAnimation) return;
-  const { start, duration, posCurve, tgtCurve, resolve } = pathAnimation;
-  const u = Math.min(1, (performance.now() - start) / duration);
-  const eased = u * u * (3 - 2 * u);
-  camera.position.copy(posCurve.getPointAt(eased));
-  controls.target.copy(tgtCurve.getPointAt(eased));
-  controls.update();
-  if (u < 1) requestAnimationFrame(tickPath);
-  else {
-    pathAnimation = null;
-    controls.enabled = true;
-    resolve();
-  }
+function stopPath() {
+  if (pathAnimation && typeof pathAnimation.stop === 'function') pathAnimation.stop();
+  else { pathAnimation = null; controls.enabled = true; }
 }
 
 /* ---------- view modes ---------- */
@@ -536,7 +641,6 @@ function applyView() {
 /* ---------- recording ---------- */
 const recBox = document.getElementById('recBox');
 const recTime = document.getElementById('recTime');
-const recHint = document.getElementById('recHint');
 let recorder = null;
 let recChunks = [];
 let recTimer = null;
@@ -613,10 +717,16 @@ function stopRecording() {
   else stopRecordingUI();
 }
 
-async function recordPath() {
+/* One button: switch to the chosen clay/depth pass, fly the camera path and save the video.
+   The recording is started here, inside the click, because captureStream needs a user gesture. */
+async function renderAndRecord() {
+  if (state.keys.length < 2) { toast('Add at least two camera keys first'); return; }
+  state.view = state.recPass;
+  applyView();
   if (!startRecording()) return;
-  await playPath();
-  setTimeout(stopRecording, 400);
+  await new Promise((r) => setTimeout(r, 250)); // let the first frames settle in the new pass
+  await playPath({ loop: false });
+  setTimeout(stopRecording, 450);
 }
 
 /* ---------- saving ---------- */
@@ -626,6 +736,8 @@ function serialize() {
   return {
     schema: SCENE_SCHEMA,
     view: state.view,
+    duration: state.duration,
+    loop: state.loop,
     camera: {
       position: camera.position.toArray().map(n => +n.toFixed(3)),
       target: controls.target.toArray().map(n => +n.toFixed(3)),
@@ -658,6 +770,8 @@ function loadScene(data) {
   data.objects.forEach((o) => addObject(o.type || 'cube', o));
   state.keys = Array.isArray(data.keys) ? data.keys : [];
   if (data.view) { state.view = data.view; applyView(); }
+  if (data.duration) setDuration(Number(data.duration));
+  if (typeof data.loop === 'boolean') setLoop(data.loop);
   if (data.camera) {
     camera.position.fromArray(data.camera.position);
     controls.target.fromArray(data.camera.target);
@@ -693,7 +807,7 @@ function downloadScene() {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `scene-${new Date().toISOString().slice(0, 10)}.json`;
+  a.download = 'scene-state.json';
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -768,10 +882,24 @@ document.getElementById('btnDelete').addEventListener('click', () => {
 
 document.getElementById('modeSeg').addEventListener('click', (e) => {
   const btn = e.target.closest('[data-mode]');
-  if (!btn) return;
-  state.mode = btn.dataset.mode;
-  document.querySelectorAll('#modeSeg button').forEach(b => b.classList.toggle('on', b === btn));
-  buildSliders();
+  if (btn) setMode(btn.dataset.mode);
+});
+
+document.getElementById('quickBar').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-qmode]');
+  if (btn) setMode(btn.dataset.qmode);
+});
+
+document.getElementById('durSeg').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-dur]');
+  if (btn) setDuration(Number(btn.dataset.dur));
+});
+
+document.getElementById('btnLoop').addEventListener('click', () => setLoop(!state.loop));
+
+document.getElementById('recModeSeg').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-rec]');
+  if (btn) setRecPass(btn.dataset.rec, true); // preview the pass as soon as it is picked
 });
 
 document.getElementById('btnReset').addEventListener('click', () => {
@@ -779,7 +907,7 @@ document.getElementById('btnReset').addEventListener('click', () => {
   if (!rec) return toast('Select a shape first');
   rec.mesh.rotation.set(0, 0, 0);
   rec.mesh.scale.set(1, 1, 1);
-  rec.mesh.position.y = rec.type === 'sphere' ? 0.55 : 0.5;
+  rec.mesh.position.y = rec.type === 'sphere' ? 0.55 : rec.type === 'plane' ? 0.02 : 0.5;
   helper.setFromObject(rec.mesh);
   syncSliders();
   persist();
@@ -805,7 +933,7 @@ document.getElementById('btnRecord').addEventListener('click', () => {
   if (state.recording) stopRecording();
   else startRecording();
 });
-document.getElementById('btnRecordPath').addEventListener('click', recordPath);
+document.getElementById('btnRenderRecord').addEventListener('click', renderAndRecord);
 document.getElementById('btnStopRec').addEventListener('click', stopRecording);
 
 document.getElementById('btnSave').addEventListener('click', downloadScene);
@@ -844,6 +972,9 @@ function frame() {
 
 /* ---------- boot ---------- */
 buildSliders();
+setDuration(state.duration);
+setLoop(state.loop);
+setRecPass(state.recPass);
 applyView();
 updateKeyInfo();
 
@@ -876,7 +1007,8 @@ if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
 // exposed for agents driving the page from a console
 window.sceneBuilder = {
   state, scene, camera, controls, addObject, serialize, loadScene, clearScene,
-  addKey, playPath, startRecording, stopRecording, applyView
+  addKey, playPath, stopPath, renderAndRecord, startRecording, stopRecording,
+  applyView, setMode, setDuration, setLoop, setRecPass
 };
 </script>
 </body>
