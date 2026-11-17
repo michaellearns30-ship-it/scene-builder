@@ -37,7 +37,7 @@
   html,body{height:100%;margin:0;overflow:hidden;background:var(--bg);color:var(--ink);
     font:15px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
     -webkit-font-smoothing:antialiased;overscroll-behavior:none}
-  #view{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
+  #view{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;background:#000}
   button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
 
   /* ---------- top HUD ---------- */
@@ -224,6 +224,12 @@
 
     <!-- RENDER -->
     <section class="panel" data-panel="render">
+      <p class="hint">Recording frame — the exact shape and size of the saved clip:</p>
+      <div class="seg" id="frameSeg">
+        <button data-frame="screen" class="on">Screen</button>
+        <button data-frame="16:9">16:9</button>
+        <button data-frame="9:16">9:16</button>
+      </div>
       <div class="seg" id="viewSeg">
         <button data-view="normal" class="on">Normal</button>
         <button data-view="clay">Clay</button>
@@ -335,6 +341,7 @@ const state = {
   duration: 5,        // seconds for the whole camera path
   loop: false,        // replay the path, and close it into a seamless circuit
   recPass: 'clay',    // clay or depth, used by Render & record
+  frame: 'screen',    // 'screen', '16:9' or '9:16' — the shape of the recorded clip
   nextId: 1,
   recording: false
 };
@@ -482,6 +489,14 @@ function setRecPass(pass, preview = false) {
     state.view = state.recPass;
     applyView();
   }
+  persist();
+}
+
+function setFrame(name) {
+  state.frame = FRAMES[name] ? name : 'screen';
+  document.querySelectorAll('#frameSeg button').forEach((b) =>
+    b.classList.toggle('on', b.dataset.frame === state.frame));
+  layoutCanvas();
   persist();
 }
 
@@ -764,6 +779,7 @@ function serialize() {
     view: state.view,
     duration: state.duration,
     loop: state.loop,
+    frame: state.frame,
     camera: {
       position: camera.position.toArray().map(n => +n.toFixed(3)),
       target: controls.target.toArray().map(n => +n.toFixed(3)),
@@ -798,6 +814,7 @@ function loadScene(data) {
   if (data.view) { state.view = data.view; applyView(); }
   if (data.duration) setDuration(Number(data.duration));
   if (typeof data.loop === 'boolean') setLoop(data.loop);
+  if (data.frame) setFrame(data.frame);
   if (data.camera) {
     camera.position.fromArray(data.camera.position);
     controls.target.fromArray(data.camera.target);
@@ -854,8 +871,9 @@ canvas.addEventListener('pointerup', (e) => {
   downAt = null;
   if (moved > 10 || !quick) return; // that was an orbit, not a tap
 
-  pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
-  pointer.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  const rect = canvas.getBoundingClientRect();
+  pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
   const hits = raycaster.intersectObjects(state.objects.map(o => o.mesh), false);
   if (hits.length) {
@@ -928,6 +946,11 @@ document.getElementById('recModeSeg').addEventListener('click', (e) => {
   if (btn) setRecPass(btn.dataset.rec, true); // preview the pass as soon as it is picked
 });
 
+document.getElementById('frameSeg').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-frame]');
+  if (btn) setFrame(btn.dataset.frame);
+});
+
 document.getElementById('btnReset').addEventListener('click', () => {
   const rec = state.selected;
   if (!rec) return toast('Select a shape first');
@@ -978,13 +1001,61 @@ document.getElementById('fileInput').addEventListener('change', async (e) => {
   e.target.value = '';
 });
 
-/* ---------- resize ---------- */
-function onResize() {
-  const w = window.innerWidth, h = window.innerHeight;
+/* ---------- resize and recording frame ---------- */
+function onResizeCamera(w, h) {
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
-  renderer.setSize(w, h, false);
 }
+
+/* Pixel sizes for the fixed frames. 720p is what these services want and what a
+   phone can hold at 30fps; the scene is composed inside this exact rectangle. */
+const FRAMES = { '16:9': [1280, 720], '9:16': [720, 1280] };
+
+function layoutCanvas() {
+  const target = FRAMES[state.frame];
+
+  if (!target) {
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
+    canvas.style.width = '100%';
+    canvas.style.height = '100%';
+    canvas.style.left = '0';
+    canvas.style.top = '0';
+    canvas.style.right = '0';
+    canvas.style.bottom = '0';
+    canvas.style.transform = 'none';
+    canvas.style.borderRadius = '0';
+    canvas.style.boxShadow = 'none';
+    onResizeCamera(window.innerWidth, window.innerHeight);
+    return;
+  }
+
+  const [w, h] = target;
+  const deck = document.querySelector('.deck');
+  const deckH = deck ? deck.getBoundingClientRect().height : 0;
+  const availH = Math.max(120, window.innerHeight - deckH);
+
+  // Pixel ratio 1 so the canvas buffer is exactly w × h and the recorded clip is
+  // exactly 1280×720 or 720×1280, whatever the phone's own screen is doing.
+  renderer.setPixelRatio(1);
+  renderer.setSize(w, h, false);
+
+  const scale = Math.min(window.innerWidth / w, availH / h);
+  const cssW = Math.round(w * scale);
+  const cssH = Math.round(h * scale);
+  canvas.style.width = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+  canvas.style.left = '50%';
+  canvas.style.top = Math.round((availH - cssH) / 2) + 'px';
+  canvas.style.right = 'auto';
+  canvas.style.bottom = 'auto';
+  canvas.style.transform = 'translateX(-50%)';
+  canvas.style.borderRadius = '10px';
+  canvas.style.boxShadow = '0 0 0 1px rgba(255,255,255,.18), 0 18px 40px -18px rgba(0,0,0,.9)';
+  onResizeCamera(w, h);
+}
+
+function onResize() { layoutCanvas(); }
 window.addEventListener('resize', onResize);
 window.addEventListener('orientationchange', () => setTimeout(onResize, 120));
 
@@ -1001,6 +1072,7 @@ buildSliders();
 setDuration(state.duration);
 setLoop(state.loop);
 setRecPass(state.recPass);
+setFrame(state.frame);
 applyView();
 updateKeyInfo();
 
@@ -1034,7 +1106,7 @@ if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
 window.sceneBuilder = {
   state, scene, camera, controls, addObject, serialize, loadScene, clearScene,
   addKey, playPath, stopPath, renderAndRecord, startRecording, stopRecording,
-  applyView, setMode, setDuration, setLoop, setRecPass
+  applyView, setMode, setDuration, setLoop, setRecPass, setFrame, layoutCanvas
 };
 </script>
 </body>
