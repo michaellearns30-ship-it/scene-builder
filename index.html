@@ -246,6 +246,10 @@
       <div class="row">
         <button class="btn" id="btnRecord">Record (manual)</button>
       </div>
+      <div class="row">
+        <button class="btn blue" id="btnMp4">Export MP4</button>
+      </div>
+      <p class="hint" id="mp4Hint">Checking whether this browser can encode MP4…</p>
       <p class="hint" id="recHint">Render &amp; record switches to the pass above, flies the camera keys and saves the video when it finishes. Chrome records .webm, Safari .mp4 — whichever the browser supports.</p>
     </section>
   </div>
@@ -580,6 +584,18 @@ function withoutClosingKey(keys) {
   return samePoint(first.p, last.p) && samePoint(first.t, last.t) ? keys.slice(0, -1) : keys;
 }
 
+/* The camera path as curves. With three or more keys and loop on, the curve
+   closes so a pass ends exactly where it began. */
+function pathCurves(asked = state.loop) {
+  const closed = !!asked && state.keys.length > 2;
+  const keys = closed ? withoutClosingKey(state.keys) : state.keys;
+  return {
+    closed,
+    posCurve: new THREE.CatmullRomCurve3(keys.map(k => new THREE.Vector3(...k.p)), closed),
+    tgtCurve: new THREE.CatmullRomCurve3(keys.map(k => new THREE.Vector3(...k.t)), closed)
+  };
+}
+
 let pathAnimation = null;
 
 /* Flies the camera along the keyframes in state.duration seconds.
@@ -593,12 +609,7 @@ function playPath(options = {}) {
 
   const repeat = options.loop !== undefined ? !!options.loop : state.loop;
   const asked = options.closed !== undefined ? !!options.closed : state.loop;
-  // A closed curve returns to its first key, so one pass ends exactly where it began.
-  // Three keys is the minimum — two would only retrace the same line.
-  const closed = asked && state.keys.length > 2;
-  const keys = closed ? withoutClosingKey(state.keys) : state.keys;
-  const posCurve = new THREE.CatmullRomCurve3(keys.map(k => new THREE.Vector3(...k.p)), closed);
-  const tgtCurve = new THREE.CatmullRomCurve3(keys.map(k => new THREE.Vector3(...k.t)), closed);
+  const { closed, posCurve, tgtCurve } = pathCurves(asked);
   const seconds = Math.max(1, Number(options.seconds || state.duration) || 5);
 
   controls.enabled = false;
@@ -720,14 +731,7 @@ function startRecording() {
     const blob = new Blob(recChunks, { type });
     const ext = type.includes('mp4') ? 'mp4' : 'webm';
     const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `scene-${stamp}.${ext}`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    downloadBlob(blob, `scene-${stamp}.${ext}`);
     toast(`Saved ${ext.toUpperCase()} — check your downloads`);
     stopRecordingUI();
   };
@@ -768,6 +772,147 @@ async function renderAndRecord() {
   await new Promise((r) => setTimeout(r, 250)); // let the first frames settle in the new pass
   await playPath({ loop: false });
   setTimeout(stopRecording, 450);
+}
+
+/* ---------- mp4 export ----------
+   MediaRecorder on Android Chrome only offers WebM, and AI video services want
+   MP4. WebCodecs can encode H.264 directly, so when it is available every frame
+   is rendered here at an exact 30fps and written into a real .mp4 container.
+   Slower than recording, but the file is the format these services accept. */
+const MP4_FPS = 30;
+const MP4_CODECS = ['avc1.42001f', 'avc1.4d401f', 'avc1.64001f'];
+let mp4Ready = false;
+let mp4Busy = false;
+
+async function pickMp4Config(width, height, fps) {
+  if (typeof window.VideoEncoder !== 'function' || typeof window.VideoFrame !== 'function') return null;
+  for (const codec of MP4_CODECS) {
+    const config = {
+      codec,
+      width,
+      height,
+      bitrate: 8_000_000,
+      framerate: fps,
+      avc: { format: 'avc' }   // mp4-muxer needs the avcC description
+    };
+    try {
+      const support = await VideoEncoder.isConfigSupported(config);
+      if (support && support.supported) return support.config || config;
+    } catch (err) { /* try the next profile */ }
+  }
+  return null;
+}
+
+async function detectMp4Support() {
+  const btn = document.getElementById('btnMp4');
+  const hint = document.getElementById('mp4Hint');
+  const config = await pickMp4Config(1280, 720, MP4_FPS);
+  mp4Ready = !!config;
+  btn.disabled = !mp4Ready;
+  hint.textContent = mp4Ready
+    ? 'Export MP4 renders every frame at a fixed 30fps and writes a real .mp4 at the recording frame size. Slower than recording, but it is the file these services accept.'
+    : 'This browser cannot encode MP4. Record the clip, then convert it: CapCut imports WebM and exports MP4, and most free converter sites do the same.';
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+async function exportMp4() {
+  if (mp4Busy) return;
+  if (state.keys.length < 2) { toast('Add at least two camera keys first'); return; }
+  if (!FRAMES[state.frame]) { toast('Pick 16:9 or 9:16 in Recording frame first'); return; }
+  if (state.recording) { toast('Stop the recorder first'); return; }
+
+  const btn = document.getElementById('btnMp4');
+  const width = canvas.width;
+  const height = canvas.height;
+  const config = await pickMp4Config(width, height, MP4_FPS);
+  if (!config) { toast('This browser cannot encode MP4 — convert the WebM instead'); return; }
+
+  let muxer;
+  try {
+    const { Muxer, ArrayBufferTarget } = await import('https://cdn.jsdelivr.net/npm/mp4-muxer@5/+esm');
+    muxer = new Muxer({
+      target: new ArrayBufferTarget(),
+      video: { codec: 'avc', width, height, frameRate: MP4_FPS },
+      fastStart: 'in-memory'
+    });
+  } catch (err) {
+    toast('Could not load the MP4 writer — check the connection');
+    return;
+  }
+
+  mp4Busy = true;
+  btn.disabled = true;
+
+  const restore = {
+    position: camera.position.clone(),
+    target: controls.target.clone(),
+    view: state.view
+  };
+  state.view = state.recPass;
+  applyView();
+
+  const { closed, posCurve, tgtCurve } = pathCurves();
+  const seconds = Math.max(1, state.duration);
+  const frames = Math.max(2, Math.round(seconds * MP4_FPS));
+  // power1.inOut is a quadratic ease; this is the same curve without GSAP.
+  const ease = (t) => closed ? t : (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+
+  let failure = null;
+  const encoder = new VideoEncoder({
+    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+    error: (err) => { failure = err; }
+  });
+  encoder.configure(config);
+
+  try {
+    for (let i = 0; i < frames; i++) {
+      if (failure) throw failure;
+      // A closed loop ends one frame short of a full turn, so the clip tiles.
+      const u = ease(closed ? i / frames : i / (frames - 1));
+      camera.position.copy(posCurve.getPointAt(u));
+      camera.lookAt(tgtCurve.getPointAt(u));
+      renderer.render(scene, camera);
+
+      const videoFrame = new VideoFrame(canvas, {
+        timestamp: Math.round((i * 1_000_000) / MP4_FPS),
+        duration: Math.round(1_000_000 / MP4_FPS)
+      });
+      encoder.encode(videoFrame, { keyFrame: i % MP4_FPS === 0 });
+      videoFrame.close();
+
+      if (encoder.encodeQueueSize > 6) await new Promise((r) => setTimeout(r, 0));
+      if (i % 15 === 0) toast(`Encoding ${Math.round((i / frames) * 100)}%`);
+    }
+
+    await encoder.flush();
+    muxer.finalize();
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    downloadBlob(new Blob([muxer.target.buffer], { type: 'video/mp4' }), `scene-${stamp}.mp4`);
+    toast(`Saved MP4 — ${width}×${height}, ${seconds}s`);
+  } catch (err) {
+    toast('MP4 export failed — record the WebM and convert it');
+  } finally {
+    try { encoder.close(); } catch (err) { /* already closed */ }
+    camera.position.copy(restore.position);
+    controls.target.copy(restore.target);
+    camera.lookAt(controls.target);
+    controls.update();
+    state.view = restore.view;
+    applyView();
+    mp4Busy = false;
+    btn.disabled = !mp4Ready;
+  }
 }
 
 /* ---------- saving ---------- */
@@ -846,15 +991,7 @@ function clearScene(ask = true) {
 
 function downloadScene() {
   const json = JSON.stringify(serialize(), null, 2);
-  const blob = new Blob([json], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'scene-state.json';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 3000);
+  downloadBlob(new Blob([json], { type: 'application/json' }), 'scene-state.json');
   toast('Scene JSON saved');
 }
 
@@ -950,6 +1087,8 @@ document.getElementById('frameSeg').addEventListener('click', (e) => {
   const btn = e.target.closest('[data-frame]');
   if (btn) setFrame(btn.dataset.frame);
 });
+
+document.getElementById('btnMp4').addEventListener('click', exportMp4);
 
 document.getElementById('btnReset').addEventListener('click', () => {
   const rec = state.selected;
@@ -1073,6 +1212,7 @@ setDuration(state.duration);
 setLoop(state.loop);
 setRecPass(state.recPass);
 setFrame(state.frame);
+detectMp4Support();
 applyView();
 updateKeyInfo();
 
@@ -1106,7 +1246,7 @@ if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
 window.sceneBuilder = {
   state, scene, camera, controls, addObject, serialize, loadScene, clearScene,
   addKey, playPath, stopPath, renderAndRecord, startRecording, stopRecording,
-  applyView, setMode, setDuration, setLoop, setRecPass, setFrame, layoutCanvas
+  applyView, setMode, setDuration, setLoop, setRecPass, setFrame, layoutCanvas, exportMp4
 };
 </script>
 </body>
