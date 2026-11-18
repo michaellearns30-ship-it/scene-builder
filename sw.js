@@ -1,18 +1,23 @@
 /* Scene Builder service worker — caches the app shell and, after the first visit, the Three.js
    modules it loads from unpkg, so the editor opens with no signal. Recorded videos never leave
    the phone: they are made by MediaRecorder on a canvas and saved straight to downloads. */
-const CACHE = "scene-builder-v1";
+const CACHE = "scene-builder-v2";
 
 const SHELL = [
   "./",
   "./index.html",
+  "./app.js",
   "./manifest.json",
   "./icons/icon-512.png"
 ];
 
 const CDN = [
   "https://unpkg.com/three@0.160.0/build/three.module.js",
-  "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js"
+  "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js",
+  "https://unpkg.com/three@0.160.0/examples/jsm/postprocessing/EffectComposer.js",
+  "https://unpkg.com/three@0.160.0/examples/jsm/postprocessing/RenderPass.js",
+  "https://unpkg.com/three@0.160.0/examples/jsm/postprocessing/UnrealBloomPass.js",
+  "https://unpkg.com/three@0.160.0/examples/jsm/postprocessing/OutputPass.js"
 ];
 
 self.addEventListener("install", (event) => {
